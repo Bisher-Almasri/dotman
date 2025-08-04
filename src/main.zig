@@ -1,6 +1,7 @@
 // DotMan
 //
-// A tool to manage your dot files.
+// A tool to manage your dot files by tracking, symlinking, and organizing them in a central repository.
+// This allows for easy backup, versioning, and synchronization across different machines.
 
 const std = @import("std");
 
@@ -22,13 +23,21 @@ pub fn main() !void {
         try init();
         return;
     } else if (std.mem.eql(u8, command, "add")) {
-        try stdout.print("not implemented", .{});
+        if (args.len != 3) {
+            try stdout.print("Usage: dotman add <path>\n", .{});
+            return;
+        }
+        try add(args[2]);
         return;
     } else if (std.mem.eql(u8, command, "list")) {
-        try stdout.print("not implemented", .{});
+        try list();
         return;
     } else if (std.mem.eql(u8, command, "remove")) {
-        try stdout.print("not implemented", .{});
+        if (args.len != 3) {
+            try stdout.print("Usage: dotman remove <path>\n", .{});
+            return;
+        }
+        try remove(args[2]);
         return;
     } else {
         try stdout.print("not command", .{});
@@ -36,14 +45,20 @@ pub fn main() !void {
     }
 }
 
+// FileRecord represents a tracked dotfile with its original location and repository location
 const FileRecord = struct {
-    original_abs: []const u8,
-    repo_abs: []const u8,
+    original_abs: []const u8, // Absolute path to the original file in user's home directory
+    repo_abs: []const u8,     // Absolute path to the file in dotman's repository
 };
+// getHomeDir returns the user's home directory path from the HOME environment variable
 fn getHomeDir() ![]const u8 {
     return std.process.getEnvVarOwned(allocator, "HOME") catch return friendly(MyError.NoHomeDir);
 }
 
+// getConfigDir determines the configuration directory for dotman using the following priority:
+// 1. DOTMAN_DIR environment variable if set
+// 2. XDG_DATA_HOME/dotman if XDG_DATA_HOME is set
+// 3. ~/.config/dotman as fallback
 fn getConfigDir() ![]u8 {
     if (try std.process.hasEnvVar(allocator, "DOTMAN_DIR")) {
         return std.process.getEnvVarOwned(allocator, "DOTMAN_DIR");
@@ -58,18 +73,21 @@ fn getConfigDir() ![]u8 {
     return std.fs.path.join(allocator, &.{ home, ".config", "dotman" });
 }
 
+// readIndex reads and parses the index file that tracks all managed dotfiles
+// The index file format is tab-separated: original_path<tab>repo_path
+// Lines starting with # are treated as comments
 fn readIndex(config_dir: []const u8) !std.ArrayList(FileRecord) {
     var lis = std.ArrayList(FileRecord).init(allocator);
 
-    const path_buf = try std.fs.path.join(allocator, .{ config_dir, "index.txt" });
+    const path_buf = try std.fs.path.join(allocator, &[_][]const u8{ config_dir, "index.txt" });
     defer allocator.free(path_buf);
 
-    const file = std.fs.openFileAbsolute(path_buf, .{ .read = true }) catch |err| {
-        if (err == error.FileNotFound) return list else return err;
+    const file = std.fs.openFileAbsolute(path_buf, .{ .mode = .read_only }) catch |err| {
+        if (err == error.FileNotFound) return lis else return err;
     };
     defer file.close();
 
-    const contents = file.reader().readAllAlloc(allocator, std.math.maxInt(usize)) catch MyError.IndexReadFailed;
+    const contents = try file.reader().readAllAlloc(allocator, std.math.maxInt(usize));
     defer allocator.free(contents);
 
     var lines = std.mem.splitAny(u8, contents, "\n");
@@ -82,12 +100,17 @@ fn readIndex(config_dir: []const u8) !std.ArrayList(FileRecord) {
         const orig = parts.next() orelse continue;
         const repo_abs = parts.next() orelse continue;
 
-        try lis.append(FileRecord{ .original_abs = orig, .repo_abs = repo_abs });
+        try lis.append(FileRecord{
+            .original_abs = try allocator.dupe(u8, orig),
+            .repo_abs = try allocator.dupe(u8, repo_abs),
+        });
     }
 
     return lis;
 }
 
+// writeIndex writes the current state of tracked files to the index file
+// Each record is written as: original_path<tab>repo_path\n
 fn writeIndex(config_dir: []const u8, lis: []const FileRecord) !void {
     const idx_path = try std.fs.path.join(allocator, &.{ config_dir, "index.txt" });
     defer allocator.free(idx_path);
@@ -97,21 +120,51 @@ fn writeIndex(config_dir: []const u8, lis: []const FileRecord) !void {
 
     var fw = idx.writer();
     for (lis) |rec| {
-        try fw.print("{}\t{}\n", .{ rec.original_abs, rec.repo_abs });
+        try fw.print("{s}\t{s}\n", .{ rec.original_abs, rec.repo_abs });
     }
 }
 
+const posix = std.posix;
+
+fn getFlags() posix.O {
+    return switch (@import("builtin").os.tag) {
+        .linux => .{ .NOFOLLOW = true, .PATH = true },
+        .macos, .freebsd, .openbsd => .{ .SYMLINK = true },
+        else => .{ .NOFOLLOW = true }, // Generic POSIX fallback
+    };
+}
+
+pub fn lstatLink(path: []const u8) !posix.Stat {
+    const flags: posix.O = getFlags();
+    const fd = try posix.open(path, flags, 0); // 0 = no mode required (read-only)
+    defer posix.close(fd);
+    return try posix.fstat(fd);
+}
+
+pub fn isLink(path: []const u8) !bool {
+    const st = try lstatLink(path);
+    return posix.S.ISLNK(st.mode);
+}
+
+// init creates a new dotman repository with the following structure:
+// - config_dir/
+//   |- files/     (where actual dotfiles are stored)
+//   |- index.txt  (tracks the mapping between original and repo files)
 fn init() !void {
     const config_dir = try getConfigDir();
     defer allocator.free(config_dir);
 
-    try std.fs.makeDirAbsolute(config_dir);
+    std.fs.makeDirAbsolute(config_dir) catch |err| {
+        if (err != error.PathAlreadyExists) return err;
+    };
 
     const files_sub = try std.fs.path.join(allocator, &.{ config_dir, "files" });
     defer allocator.free(files_sub);
 
     _ = std.fs.deleteTreeAbsolute(files_sub) catch {};
-    try std.fs.makeDirAbsolute(files_sub);
+    std.fs.makeDirAbsolute(files_sub) catch |err| {
+        if (err != error.PathAlreadyExists) return err;
+    };
 
     const idx_path = try std.fs.path.join(allocator, &.{ config_dir, "index.txt" });
     defer allocator.free(idx_path);
@@ -122,19 +175,172 @@ fn init() !void {
     try std.io.getStdOut().writer().print("Initialized dotman repo at {s}\n", .{config_dir});
 }
 
-fn remove() !void {}
+// add tracks a new dotfile in the repository
+// It performs the following steps:
+// 1. Resolves and validates the absolute path
+// 2. Ensures the file is within the home directory
+// 3. Creates necessary directory structure in the repo
+// 4. Creates a symlink from the repo to the original location
+// 5. Updates the index file with the new entry
+fn add(path_arg: []const u8) !void {
+    const stdout = std.io.getStdOut().writer();
 
-fn list() !void {}
+    const home = getHomeDir() catch return MyError.NoHomeDir;
+    defer allocator.free(home);
 
-pub const MyError = error{
-    NoHomeDir,
-    NotInHome,
-    InvalidRel,
-    AlreadyTracked,
-    NotTracked,
-    IndexReadFailed,
-    IndexWriteFailed,
-};
+    var abs = try std.fs.path.resolve(allocator, &.{path_arg});
+    defer allocator.free(abs);
+
+    if (abs.len == 0 or abs[0] != '/') {
+        const joined = try std.fs.path.join(allocator, &[_][]const u8{ home, abs });
+        allocator.free(abs);
+        abs = joined;
+    }
+
+    const real_abs = try std.fs.realpathAlloc(allocator, abs);
+    allocator.free(abs);
+    abs = real_abs;
+
+    const home_slash = try std.fs.path.join(allocator, &[_][]const u8{ home, "/" });
+    defer allocator.free(home_slash);
+
+    if (!std.mem.startsWith(u8, abs, home_slash)) {
+        return MyError.NotInHome;
+    }
+
+    const config_dir = getConfigDir() catch return MyError.ConfigDirLookupFailed;
+    defer allocator.free(config_dir);
+
+    const files_sub = try std.fs.path.join(allocator, &[_][]const u8{ config_dir, "/files" });
+    defer allocator.free(files_sub);
+
+    const rel = abs[home.len + 1 .. abs.len];
+    const repo_abs = try std.fs.path.join(allocator, &[_][]const u8{ files_sub, rel });
+    defer allocator.free(repo_abs);
+
+    var index = readIndex(config_dir) catch |e|
+        return if (e == MyError.IndexReadFailed) e else e;
+    defer index.deinit();
+
+    for (index.items) |rec| {
+        if (std.mem.eql(u8, rec.original_abs, abs)) {
+            return MyError.AlreadyTracked;
+        }
+    }
+
+    const dirname = std.fs.path.dirname(repo_abs) orelse return MyError.InvalidRel;
+    std.fs.cwd().makeDir(dirname) catch |err| {
+        if (err != error.PathAlreadyExists) return err;
+    };
+
+    try std.fs.cwd().symLink(abs, repo_abs, .{});
+
+    try index.append(FileRecord{
+        .original_abs = try allocator.dupe(u8, abs),
+        .repo_abs = try allocator.dupe(u8, repo_abs),
+    });
+
+    try writeIndex(config_dir, try index.toOwnedSlice());
+
+    try stdout.print("Added: {s}\n → {s}\n", .{ abs, repo_abs });
+    return;
+}
+
+fn remove(path_arg: []const u8) !void {
+    const stdout = std.io.getStdOut().writer();
+
+    const home = try getHomeDir();
+    defer allocator.free(home);
+
+    var abs = try std.fs.path.resolve(allocator, &.{path_arg});
+    defer allocator.free(abs);
+
+    if (abs.len == 0 or abs[0] != '/') {
+        const joined = try std.fs.path.join(allocator, &[_][]const u8{ home, abs });
+        allocator.free(abs);
+        abs = joined;
+    }
+
+    const config_dir = try getConfigDir();
+    defer allocator.free(config_dir);
+
+    var index = try readIndex(config_dir);
+    defer index.deinit();
+
+    var found_idx: ?usize = null;
+    for (index.items, 0..) |rec, i| {
+        if (std.mem.eql(u8, rec.original_abs, abs)) {
+            found_idx = i;
+            break;
+        }
+    }
+
+    if (found_idx == null) {
+        return MyError.NotTracked;
+    }
+
+    const record = index.items[found_idx.?];
+
+    // Remove symlink if it exists and points to our repo
+    if (try isLink(record.original_abs)) {
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        const target = try std.fs.cwd().readLink(record.original_abs, &buffer);
+        if (std.mem.eql(u8, target, record.repo_abs)) {
+            try std.fs.deleteFileAbsolute(record.original_abs);
+        }
+    }
+
+    // Remove the file from repo
+    std.fs.deleteFileAbsolute(record.repo_abs) catch |err| {
+        if (err != error.FileNotFound) return err;
+    };
+
+    // Remove the record from index
+    _ = index.orderedRemove(found_idx.?);
+    try writeIndex(config_dir, index.items);
+
+    try stdout.print("Removed: {s}\n", .{abs});
+}
+
+// list displays all tracked files and their current status:
+// - [OK]: File is correctly symlinked to the repo
+// - [Bad link]: File is symlinked but to wrong destination
+// - [Not linked]: File exists but is not a symlink
+// - [Not found]: Original file doesn't exist
+// - [Broken link]: Symlink exists but target is invalid
+fn list() !void {
+    const stdout = std.io.getStdOut().writer();
+    const config_dir = try getConfigDir();
+    defer allocator.free(config_dir);
+    const index = try readIndex(config_dir);
+    defer index.deinit();
+
+    if (index.items.len == 0) {
+        try stdout.print("No files are tracked.\n", .{});
+        return;
+    }
+
+    try stdout.print("{s: <50} {s: <15} {s}\n", .{ "Original", "Status", "Repo" });
+    for (index.items) |rec| {
+        var status: []const u8 = "";
+        
+        if (try isLink(rec.repo_abs)) {
+            var buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const rd = std.fs.cwd().readLink(rec.repo_abs, &buffer) catch {
+                status = "[Broken link]";
+                try stdout.print("{s: <50} {s: <15} {s}\n", .{ rec.original_abs, status, rec.repo_abs });
+                continue;
+            };
+            status = if (std.mem.eql(u8, rd, rec.original_abs)) "[OK]" else "[Bad link]";
+        } else {
+            status = "[Not linked]";
+        }
+        try stdout.print("{s: <50} {s: <15} {s}\n", .{ rec.original_abs, status, rec.repo_abs });
+    }
+}
+
+// Custom error types for dotman-specific error conditions
+pub const MyError = error{ NoHomeDir, NotInHome, InvalidRel, AlreadyTracked, NotTracked, IndexReadFailed, IndexWriteFailed, ConfigDirLookupFailed };
 
 pub fn friendly(err: MyError) []const u8 {
     return switch (err) {
@@ -145,5 +351,6 @@ pub fn friendly(err: MyError) []const u8 {
         MyError.NotTracked => "That file is not tracked",
         MyError.IndexReadFailed => "Failed to read index",
         MyError.IndexWriteFailed => "Failed to write index",
+        MyError.ConfigDirLookupFailed => "Cannot find Config Dir",
     };
 }
