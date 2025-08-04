@@ -13,14 +13,30 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     if (args.len < 2) {
-        try stdout.print("Usage: dotman [init|add|list|remove]\n", .{});
+  try stdout.print(
+            \\Usage: dotman <command> [args]\n\n
+            \\Commands:\n
+            \\  init [repository-url]  Initialize dotman (optionally with a remote repository)\n
+            \\  add <path>            Track a new dotfile\n
+            \\  list                  Show tracked dotfiles\n
+            \\  remove <path>         Stop tracking a dotfile\n
+            \\  push                  Push changes to remote repository\n
+            \\  pull                  Pull changes from remote repository\n
+            \\  sync                  Synchronize with remote repository\n
+        , // <- Add this comma to separate arguments
+        .{}
+        );
         return;
     }
 
     const command = args[1];
 
     if (std.mem.eql(u8, command, "init")) {
-        try init();
+        if (args.len > 2) {
+            try init(args[2]);
+        } else {
+            try init(null);
+        }
         return;
     } else if (std.mem.eql(u8, command, "add")) {
         if (args.len != 3) {
@@ -39,8 +55,17 @@ pub fn main() !void {
         }
         try remove(args[2]);
         return;
+    } else if (std.mem.eql(u8, command, "push")) {
+        try push();
+        return;
+    } else if (std.mem.eql(u8, command, "pull")) {
+        try pull();
+        return;
+    } else if (std.mem.eql(u8, command, "sync")) {
+        try sync();
+        return;
     } else {
-        try stdout.print("not command", .{});
+        try stdout.print("Unknown command: {s}\n", .{command});
         return;
     }
 }
@@ -150,7 +175,8 @@ pub fn isLink(path: []const u8) !bool {
 // - config_dir/
 //   |- files/     (where actual dotfiles are stored)
 //   |- index.txt  (tracks the mapping between original and repo files)
-fn init() !void {
+fn init(repo_url: ?[]const u8) !void {
+    const stdout = std.io.getStdOut().writer();
     const config_dir = try getConfigDir();
     defer allocator.free(config_dir);
 
@@ -172,7 +198,48 @@ fn init() !void {
     const idx = try std.fs.createFileAbsolute(idx_path, .{ .truncate = true });
     defer idx.close();
 
-    try std.io.getStdOut().writer().print("Initialized dotman repo at {s}\n", .{config_dir});
+    // Initialize git repository
+    var child = std.process.Child.init(&[_][]const u8{ "git", "init", "--quiet" }, allocator);
+    child.cwd = config_dir;
+    var result = try child.spawnAndWait();
+
+    if (result.Exited != 0) {
+        return error.GitError;
+    }
+
+    // Create .gitignore file
+    const gitignore_path = try std.fs.path.join(allocator, &.{ config_dir, ".gitignore" });
+    defer allocator.free(gitignore_path);
+
+    const gitignore = try std.fs.createFileAbsolute(gitignore_path, .{ .truncate = true });
+    defer gitignore.close();
+
+    try gitignore.writeAll("# Ignore system and hidden files\n.*\n!.gitignore\n");
+
+    try stdout.print("Initialized dotman repo with Git at {s}\n", .{config_dir});
+
+    child = std.process.Child.init(&[_][]const u8{ "git", "branch", "-M", "main"}, allocator);
+    child.cwd = config_dir;
+    result = try child.spawnAndWait();
+
+    if (result.Exited != 0) {
+        return error.GitError;
+    }
+
+    if (repo_url) |url| {
+        // Add remote repository
+        child = std.process.Child.init(&[_][]const u8{ "git", "remote", "add", "origin", url}, allocator);
+        child.cwd = config_dir;
+        result = try child.spawnAndWait();
+
+        if (result.Exited != 0) {
+            return error.GitError;
+        }
+
+        try stdout.print("Added remote repository: {s}\n", .{url});
+    } else {
+        try stdout.print("To add a remote repository later, use:\ngit remote add origin <repository-url>\n", .{});
+    }
 }
 
 // add tracks a new dotfile in the repository
@@ -340,7 +407,7 @@ fn list() !void {
 }
 
 // Custom error types for dotman-specific error conditions
-pub const MyError = error{ NoHomeDir, NotInHome, InvalidRel, AlreadyTracked, NotTracked, IndexReadFailed, IndexWriteFailed, ConfigDirLookupFailed };
+pub const MyError = error{ NoHomeDir, NotInHome, InvalidRel, AlreadyTracked, NotTracked, IndexReadFailed, IndexWriteFailed, ConfigDirLookupFailed, GitError };
 
 pub fn friendly(err: MyError) []const u8 {
     return switch (err) {
@@ -352,5 +419,60 @@ pub fn friendly(err: MyError) []const u8 {
         MyError.IndexReadFailed => "Failed to read index",
         MyError.IndexWriteFailed => "Failed to write index",
         MyError.ConfigDirLookupFailed => "Cannot find Config Dir",
+        MyError.GitError => "Git operation failed",
     };
+}
+
+// push commits and pushes changes to the remote repository
+fn push() !void {
+    const config_dir = try getConfigDir();
+    defer allocator.free(config_dir);
+
+    var child = std.process.Child.init(&[_][]const u8{ "git", "add", "." }, allocator);
+    child.cwd = config_dir;
+    _ = try child.spawnAndWait();
+
+    child = std.process.Child.init(&[_][]const u8{ "git", "commit", "-m", "Update dotfiles" }, allocator);
+    child.cwd = config_dir;
+    _ = try child.spawnAndWait();
+
+    child = std.process.Child.init(&[_][]const u8{ "git", "push", "--set-upstream", "origin", "main" }, allocator);
+    child.cwd = config_dir;
+    const result = try child.spawnAndWait();
+
+    if (result.Exited != 0) {
+        // Try regular push if setting upstream failed (in case it's already set)
+        child = std.process.Child.init(&[_][]const u8{ "git", "push" }, allocator);
+        child.cwd = config_dir;
+        const retry_result = try child.spawnAndWait();
+        
+        if (retry_result.Exited != 0) {
+            return error.GitError;
+        }
+    }
+
+    try std.io.getStdOut().writer().print("Successfully pushed changes to remote repository\n", .{});
+}
+
+// pull fetches and merges changes from the remote repository
+fn pull() !void {
+    const config_dir = try getConfigDir();
+    defer allocator.free(config_dir);
+
+    var child = std.process.Child.init(&[_][]const u8{ "git", "pull" }, allocator);
+    child.cwd = config_dir;
+    const result = try child.spawnAndWait();
+
+    if (result.Exited != 0) {
+        return error.GitError;
+    }
+
+    try std.io.getStdOut().writer().print("Successfully pulled changes from remote repository\n", .{});
+}
+
+// sync performs both pull and push operations
+fn sync() !void {
+    try pull();
+    try push();
+    try std.io.getStdOut().writer().print("Successfully synchronized with remote repository\n", .{});
 }
