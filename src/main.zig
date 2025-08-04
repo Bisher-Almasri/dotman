@@ -14,15 +14,16 @@ pub fn main() !void {
 
     if (args.len < 2) {
   try stdout.print(
-            \\Usage: dotman <command> [args]\n\n
-            \\Commands:\n
-            \\  init [repository-url]  Initialize dotman (optionally with a remote repository)\n
-            \\  add <path>            Track a new dotfile\n
-            \\  list                  Show tracked dotfiles\n
-            \\  remove <path>         Stop tracking a dotfile\n
-            \\  push                  Push changes to remote repository\n
-            \\  pull                  Pull changes from remote repository\n
-            \\  sync                  Synchronize with remote repository\n
+            \\Usage: dotman <command> [args]
+            \\Commands:
+            \\  init [repository-url]  Initialize dotman (optionally with a remote repository)
+            \\  add <path>            Track a new dotfile
+            \\  list                  Show tracked dotfiles
+            \\  remove <path>         Stop tracking a dotfile
+            \\  push                  Push changes to remote repository
+            \\  pull                  Pull changes from remote repository
+            \\  sync                  Synchronize with remote repository
+            \\
         , // <- Add this comma to separate arguments
         .{}
         );
@@ -207,14 +208,6 @@ fn init(repo_url: ?[]const u8) !void {
         return error.GitError;
     }
 
-    // Create .gitignore file
-    const gitignore_path = try std.fs.path.join(allocator, &.{ config_dir, ".gitignore" });
-    defer allocator.free(gitignore_path);
-
-    const gitignore = try std.fs.createFileAbsolute(gitignore_path, .{ .truncate = true });
-    defer gitignore.close();
-
-    try gitignore.writeAll("# Ignore system and hidden files\n.*\n!.gitignore\n");
 
     try stdout.print("Initialized dotman repo with Git at {s}\n", .{config_dir});
 
@@ -459,9 +452,13 @@ fn pull() !void {
     const config_dir = try getConfigDir();
     defer allocator.free(config_dir);
 
-    var child = std.process.Child.init(&[_][]const u8{ "git", "pull" }, allocator);
+    var child = std.process.Child.init(&[_][]const u8{ "rm", "-rf", "index.txt" }, allocator);
     child.cwd = config_dir;
-    const result = try child.spawnAndWait();
+    var result = try child.spawnAndWait();
+
+    child = std.process.Child.init(&[_][]const u8{ "git", "pull", "origin", "main" }, allocator);
+    child.cwd = config_dir;
+    result = try child.spawnAndWait();
 
     if (result.Exited != 0) {
         return error.GitError;
